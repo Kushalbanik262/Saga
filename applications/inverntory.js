@@ -65,7 +65,7 @@ app.post("/rollback",(req,res)=>{
 });
 
 app.listen(PORT,()=>{
-    console.log(`Server started on PORT:${PORT}`);
+    console.log(`Inventory Service Started Successfully on PORT:${PORT}`);
 });
 
 
