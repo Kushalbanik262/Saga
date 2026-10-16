@@ -1,0 +1,28 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: rabbitmq
+    restart: unless-stopped
+    ports:
+      # AMQP protocol port (used by applications to publish/consume messages)
+      - "5672:5672"
+      # HTTP Management UI port 
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=SuperSecretPassword123
+      - RABBITMQ_DEFAULT_VHOST=/
+    volumes:
+      # Persists RabbitMQ data outside the container
+      - rabbitmq_data:/var/lib/rabbitmq
+      # Persists RabbitMQ logs
+      - rabbitmq_logs:/var/log/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  rabbitmq_data:
+  rabbitmq_logs:
