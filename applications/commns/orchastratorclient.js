@@ -1,18 +1,23 @@
-import { createConnectionAndReturnChannel,postMessage } from "./commns/connections";
+import { createConnectionAndReturnChannel,postMessage } from "./connections.js";
+
+export const INV_ORCH_REQUEST_QUEUE = "IV:orchastrator_req"; 
+export const INV_ORCH_RESPONSE_QUEUE = "IV:orchastrator_res";
 
 
 
-async function postToOrchastrator(message, ORCH_REQUEST_QUEUE,CONNECTION_CHANNEL){
-    console.log(`[] Posting to Orchastrator with message :${message}`);
-    try{
+export async function postToOrchastrator(message, ORCH_REQUEST_QUEUE,CONNECTION_CHANNEL){
+    console.log(`[] Posting to Orchastrator with message :${JSON.stringify(message)}`);
      if(CONNECTION_CHANNEL == null){
-         CONNECTION_CHANNEL = await createConnectionAndReturnChannel();
+         throw new Error("Invalid Connection Channel");
      }
      const msg = {
          "message" : message,
          "time" : Date.now()
      }
      await postMessage(CONNECTION_CHANNEL,msg,ORCH_REQUEST_QUEUE);
-  }
-  catch(error){}
 }
+
+
+export const action = Object.freeze({
+    ADD : "add",
+    ROLLBACK : "rollback"});
