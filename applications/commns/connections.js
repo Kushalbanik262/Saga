@@ -1,74 +1,89 @@
-import amqp from 'amqplib';
+import amqp from "amqplib";
 
-// Default local connection URL. As noted by users on Stack Overflow, if your 
-// credentials contain special characters, make sure they are properly encoded 
-// in the connection string format: amqp://user:pass@host:port
-const RABBITMQ_URL = 'amqp://admin:SuperSecretPassword123@localhost:5672/%2f'; 
-const TEST_QUEUE_NAME = 'test_queue';
+const RABBITMQ_URL = "amqp://admin:SuperSecretPassword123@localhost:5672/%2f";
+export const TOPIC_EXCHANGE = "saga.topic";
 
-
-/**
- * Makes Sure the Queue exists and Connection is Durable
- * @param {*} channel 
- * @param {*} queueName 
- * @returns 
- */
-export async function queueExistsAndConnectionDurable(channel,queueName){
-        // 3. Ensure the queue exists (durable: true survives server restarts)
-        await channel.assertQueue(queueName, { durable: true });
-        return channel;
+function serializeError(error) {
+    return { name: error?.name, message: error?.message, stack: error?.stack };
 }
 
-
-/**
- * Caller Expected to have the sequence to first createConnectionAndReturnChannel and then queueExistsAndConnectionDurable
- */
-
-export async function createConnectionAndReturnChannel(QUEUE_NAME = TEST_QUEUE_NAME){
-        // 1. Establish a connection to the RabbitMQ server
-        console.log('Connecting to RabbitMQ...');
-        const connection = await amqp.connect(RABBITMQ_URL);
-        const channel = await connection.createChannel();
-        console.log('Successfully connected and channel created.');
-        return await queueExistsAndConnectionDurable(channel,QUEUE_NAME);
+export function log(service, level, event, details = {}) {
+    const entry = { timestamp: new Date().toISOString(), service, level, event, ...details };
+    const output = JSON.stringify(entry);
+    if (level === "ERROR") console.error(output);
+    else if (level === "WARN") console.warn(output);
+    else console.log(output);
 }
 
-
-
-export async function subscribeToChannel(QUEUE,channel,subscription){
-    console.log(`[CHANNEL SUBSCRIPTION] Subsribing to Channel for QUEUE:${QUEUE}`);
-    channel.consume(QUEUE,subscription);
+export function errorDetails(error) {
+    return serializeError(error);
 }
 
-
-/**
- * Post Message to the channel Created
- * @param {*} channel 
- * @param {*} message 
- */
-export async function postMessage(channel,text,QUEUE = TEST_QUEUE_NAME){
-    const message = JSON.stringify(text);
-    channel.sendToQueue(QUEUE, Buffer.from(message), { persistent: true });
-    console.log(`[x] Sent: ${message}`);
+export async function createConnectionAndReturnChannel(service = "unknown") {
+    log(service, "INFO", "rabbitmq.connecting", { exchange: TOPIC_EXCHANGE });
+    const connection = await amqp.connect(RABBITMQ_URL);
+    const channel = await connection.createChannel();
+    await channel.assertExchange(TOPIC_EXCHANGE, "topic", { durable: true });
+    log(service, "INFO", "rabbitmq.connected", { exchange: TOPIC_EXCHANGE });
+    return channel;
 }
 
-
-export async function testPing() {
-    try {
-        const channel = await createConnectionAndReturnChannel();
-        postMessage(channel,"Hello RabbitMQ");
-        // --- Example: Consuming a Message ---
-        console.log('Waiting for messages...');
-        await subscribeToChannel(TEST_QUEUE_NAME,channel,(msg) => {
-            if (msg !== null) {
-                console.log(`[o] Received: ${msg.content.toString()}`);
-                
-                // Acknowledge receipt of the message
-                channel.ack(msg);
-            }
-        });
-
-    } catch (error) {
-        console.error('Error connecting to RabbitMQ:', error);
+export async function subscribeToTopic(channel, { service, queue, routingKeys, handler }) {
+    await channel.assertQueue(queue, { durable: true });
+    for (const routingKey of routingKeys) {
+        await channel.bindQueue(queue, TOPIC_EXCHANGE, routingKey);
     }
+
+    log(service, "INFO", "topic.subscribed", { queue, routingKeys });
+    await channel.consume(queue, async (rawMessage) => {
+        if (rawMessage === null) {
+            log(service, "WARN", "topic.consumer.cancelled", { queue });
+            return;
+        }
+
+        let message;
+        try {
+            message = JSON.parse(rawMessage.content.toString());
+            log(service, "INFO", "topic.message.received", {
+                queue,
+                routingKey: rawMessage.fields.routingKey,
+                correlationId: message.correlationId,
+                messageId: message.messageId
+            });
+            await handler(message, rawMessage.fields.routingKey);
+            channel.ack(rawMessage);
+            log(service, "INFO", "topic.message.acknowledged", {
+                queue,
+                routingKey: rawMessage.fields.routingKey,
+                correlationId: message.correlationId,
+                messageId: message.messageId
+            });
+        } catch (error) {
+            log(service, "ERROR", "topic.message.failed", {
+                queue,
+                routingKey: rawMessage.fields.routingKey,
+                correlationId: message?.correlationId,
+                messageId: message?.messageId,
+                error: serializeError(error)
+            });
+            channel.nack(rawMessage, false, false);
+        }
+    });
+}
+
+export async function publishToTopic(channel, routingKey, message, service) {
+    const published = channel.publish(
+        TOPIC_EXCHANGE,
+        routingKey,
+        Buffer.from(JSON.stringify(message)),
+        { persistent: true, contentType: "application/json" }
+    );
+    log(service, "INFO", "topic.message.published", {
+        exchange: TOPIC_EXCHANGE,
+        routingKey,
+        correlationId: message.correlationId,
+        messageId: message.messageId,
+        published
+    });
+    return published;
 }

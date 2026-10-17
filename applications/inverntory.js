@@ -1,171 +1,141 @@
 import express from "express";
-import { action, INV_ORCH_REQUEST_QUEUE, INV_ORCH_RESPONSE_QUEUE, postToOrchastrator } from "./commns/orchastratorclient.js";
-import { createConnectionAndReturnChannel,postMessage, queueExistsAndConnectionDurable, subscribeToChannel } from "./commns/connections.js";
+import { randomUUID } from "node:crypto";
+import {
+    action,
+    INV_ORCH_RESPONSE_QUEUE,
+    INV_ORCH_RESPONSE_ROUTING_KEY,
+    postToOrchastrator
+} from "./commns/orchastratorclient.js";
+import {
+    createConnectionAndReturnChannel,
+    errorDetails,
+    log,
+    subscribeToTopic
+} from "./commns/connections.js";
+
+const SERVICE = "inventory";
+const PORT = 8081;
 const app = express();
+const map = new Map([["rice", 10], ["shampoo", 20], ["headphone", 3]]);
+let channel;
 
 app.use(express.json());
 
-const PORT = 8081
-const map = new Map();
+app.post("/buy/items", async (req, res) => {
+    const correlationId = req.get("x-correlation-id") ?? randomUUID();
+    const request = { ...req.body, correlationId };
 
-var CONNECTION = null;
+    log(SERVICE, "INFO", "inventory.purchase.requested", {
+        correlationId,
+        itemId: request.id,
+        quantity: request.quantity
+    });
 
-// Mock some products
-map.set("rice",10);
-map.set("shampoo",20);
-map.set("headphone",3);
-
-
-// curl --json '{"name":"John","role":"admin"}' http://localhost:8081/buy/items
-app.post("/buy/items",async (req,res)=>{
-    console.log(`[Inventory Request] Request: ${JSON.stringify(req.body)}`);
-    try{
-        // Send Request to the Orchastrator about reducing the stock
-        await commandToOrchastrator(req.body,action.ADD);
-        //reduceInventory(id,quantity);
-        res.status(200).json(`{"ItemId":${id} , "Quantity" : ${map.get(id)}}`);
-    }
-    catch(error){
-        // Issue while redcing
-        res.status(400).json(`{'message' : 'Operation Failed:${error}'}`);
-    }
-    finally{
-         res.send();
-    }
-});
-
-
-// Buy Any Item
-app.post("/rollback",(req,res)=>{
-    var request = JSON.stringify(req.body).command; 
-    /**
-     * "rollback":{
-     *  "command":{
-     *      "id" : <>,
-     *       "quantity" : <>
-     *   }
-     * }
-     * 
-     */
-    try{
-        console.log("Reverting the Operation...");
-        increaseInventory(id,quantity); // Increase the reverted 
-        res.status(200).json(`{"ItemId":${id} , "Quantity" : ${map.get(id)}}`);
-        res.send();
-    }
-    catch(error){
-        res.status(400).json(`{'message' : 'Operation Failed:${error}'}`);
+    try {
+        await commandToOrchestrator(request, action.ADD);
+        return res.status(202).json({
+            message: "Inventory operation accepted",
+            correlationId,
+            itemId: request.id,
+            quantity: request.quantity
+        });
+    } catch (error) {
+        log(SERVICE, "ERROR", "inventory.purchase.request.failed", {
+            correlationId,
+            itemId: request.id,
+            quantity: request.quantity,
+            error: errorDetails(error)
+        });
+        return res.status(500).json({ message: "Unable to submit inventory operation", correlationId });
     }
 });
 
-app.listen(PORT,()=>{
-    console.log(`Inventory Service Started Successfully on PORT:${PORT}`);
+app.post("/rollback", async (req, res) => {
+    const correlationId = req.get("x-correlation-id") ?? randomUUID();
+    const { id, quantity } = req.body;
+    try {
+        increaseInventory(id, quantity);
+        log(SERVICE, "INFO", "inventory.rollback.completed", {
+            correlationId, itemId: id, quantity, remainingQuantity: map.get(id)
+        });
+        return res.status(200).json({ itemId: id, quantity: map.get(id), correlationId });
+    } catch (error) {
+        log(SERVICE, "ERROR", "inventory.rollback.failed", {
+            correlationId, itemId: id, quantity, error: errorDetails(error)
+        });
+        return res.status(400).json({ message: "Inventory rollback failed", correlationId });
+    }
 });
 
-
-function increaseInventory(itemId,quantity){
-    // NOTE: For Now this is only in case of revert
-    if(itemId == null || !map.has(itemId)){
-        throw new Error(`Invalid Item ${itemId}`);
+function increaseInventory(itemId, quantity) {
+    const parsedQuantity = parseInt(quantity, 10);
+    if (itemId == null || !map.has(itemId) || !Number.isFinite(parsedQuantity) || parsedQuantity < 0) {
+        throw new Error(`Invalid rollback item or quantity: ${itemId}, ${quantity}`);
     }
-    map.set(itemId , map.get(itemId) + quantity); // reduce the item
+    map.set(itemId, map.get(itemId) + parsedQuantity);
 }
 
-
-function rollbackAction(request){
-    try{
-        let id = request['id'];
-        let quantity = parseInt(request['quantity']);
-        increaseInventory(id,quantity);
-    }
-    catch(error){
-        console.error(`Issue While Rerverting :${error}`);
-    }
+function reduceInventory(itemId, quantity) {
+    const parsedQuantity = parseInt(quantity, 10);
+    if (itemId == null || !map.has(itemId)) throw new Error(`Item ${itemId} not found`);
+    if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) throw new Error(`Invalid quantity: ${quantity}`);
+    if (map.get(itemId) < parsedQuantity) throw new Error(`Insufficient inventory for item ${itemId}`);
+    map.set(itemId, map.get(itemId) - parsedQuantity);
+    return map.get(itemId);
 }
 
-
-// Affermative Action
-async function proceedAction(request){
-    // what if falilure in proceed action
-    try{
-        let id = request.id;
-        let quantity = parseInt(request.quantity);
-        reduceInventory(id,quantity);
-    }
-    catch(error){
-        // Make Orchastrator aware that Inventory reduction failed
-        await commandToOrchastrator(request,action.ROLLBACK);
-    }
-}
-
-
-// basically Mocks to Reduce tge inventory
-function reduceInventory(itemId,quantity){
-    if(itemId == null){
-        throw new Error(`ItemId is Null`);
-    }
-    if(!map.has(itemId)){
-        throw new Error(`Item ${itemId} Not Found`);
-    }
-    // Reduce The Inventory
-    if(map.get(itemId) < quantity){
-        throw new Error(`Item UnderFlow`);
-    }
-    console.log(`Reducing Item:${itemId} for ${quantity}`)
-    map.set(itemId , map.get(itemId) - quantity); // reduce the item
-}
-
-// POST the Reduce Request to the Orchastrator
-
-async function commandToOrchastrator(request,commandType){
-    const oReq = {
-        "type" : commandType,
-        "itemId" : request.id,
-        "itemQuantity" : request.quantity
+async function commandToOrchestrator(request, commandType) {
+    const command = {
+        type: commandType,
+        itemId: request.id,
+        itemQuantity: request.quantity,
+        correlationId: request.correlationId
     };
-
-    console.log(`[COMMAND] ${oReq}`)
-
-    if(CONNECTION == null){
-        CONNECTION = await createConnectionAndReturnChannel(INV_ORCH_REQUEST_QUEUE);
-    }
-    await queueExistsAndConnectionDurable(CONNECTION,INV_ORCH_REQUEST_QUEUE); 
-    await postToOrchastrator(oReq,INV_ORCH_REQUEST_QUEUE,CONNECTION);
+    if (channel == null) channel = await createConnectionAndReturnChannel(SERVICE);
+    await postToOrchastrator(command, channel);
 }
 
+async function executeAction(envelope) {
+    const message = envelope.message ?? envelope;
+    const { action: requestedAction, id, quantity } = message;
+    log(SERVICE, "INFO", "inventory.action.started", {
+        correlationId: envelope.correlationId, action: requestedAction, itemId: id, quantity
+    });
 
-async function listnerToOrchResponse(){
-    if(CONNECTION == null){
-        CONNECTION = await createConnectionAndReturnChannel(INV_ORCH_RESPONSE_QUEUE);
+    if (requestedAction === "PROCEED") {
+        try {
+            const remainingQuantity = reduceInventory(id, quantity);
+            log(SERVICE, "INFO", "inventory.reduction.completed", {
+                correlationId: envelope.correlationId, itemId: id, quantity, remainingQuantity
+            });
+        } catch (error) {
+            log(SERVICE, "ERROR", "inventory.reduction.failed", {
+                correlationId: envelope.correlationId, itemId: id, quantity, error: errorDetails(error)
+            });
+            await commandToOrchestrator({ ...message, correlationId: envelope.correlationId }, action.ROLLBACK);
+        }
+    } else if (requestedAction === "ROLLBACK") {
+        increaseInventory(id, quantity);
+        log(SERVICE, "INFO", "inventory.rollback.completed", {
+            correlationId: envelope.correlationId, itemId: id, quantity, remainingQuantity: map.get(id)
+        });
+    } else {
+        throw new Error(`Unsupported inventory action: ${requestedAction}`);
     }
-    queueExistsAndConnectionDurable(CONNECTION,INV_ORCH_RESPONSE_QUEUE);
+}
 
-    subscribeToChannel(INV_ORCH_RESPONSE_QUEUE,CONNECTION,async (rawdata)=>{
-        const msg = JSON.parse(rawdata.content.toString());
-        console.log(`[RECEIVED FROM ACTIVEMQ] Channel/Queue: ${INV_ORCH_REQUEST_QUEUE} Message:${JSON.stringify(msg)}`);
-        executeAction(msg);
+async function listenToOrchestrator() {
+    if (channel == null) channel = await createConnectionAndReturnChannel(SERVICE);
+    await subscribeToTopic(channel, {
+        service: SERVICE,
+        queue: INV_ORCH_RESPONSE_QUEUE,
+        routingKeys: [INV_ORCH_RESPONSE_ROUTING_KEY],
+        handler: executeAction
     });
 }
 
-
-
-async function executeAction(msg){
-    switch(msg.action){
-        case "PROCEED": proceedAction(msg);break;
-        case "ROLLBACK": rollbackAction(msg);break;
-    }
-}
-
-listnerToOrchResponse(); // init method -- start listnening the orchastrator
-
-
-/**
- * Response Message Contract
- * 
- * "action" : "PROCEED" / "ROLLBACK"
- * 
- * 
- * 
- * 
- * 
- */
+app.listen(PORT, () => log(SERVICE, "INFO", "http.started", { port: PORT }));
+listenToOrchestrator().catch((error) => {
+    log(SERVICE, "ERROR", "topic.listener.failed", { error: errorDetails(error) });
+    process.exitCode = 1;
+});

@@ -1,23 +1,27 @@
-import { createConnectionAndReturnChannel,postMessage } from "./connections.js";
+import { randomUUID } from "node:crypto";
+import { publishToTopic } from "./connections.js";
 
-export const INV_ORCH_REQUEST_QUEUE = "IV:orchastrator_req"; 
-export const INV_ORCH_RESPONSE_QUEUE = "IV:orchastrator_res";
+export const INV_ORCH_REQUEST_QUEUE = "orchestrator.inventory.commands";
+export const INV_ORCH_RESPONSE_QUEUE = "inventory.orchestrator.responses";
+export const INV_ORCH_REQUEST_ROUTING_KEY = "inventory.command.#";
+export const INV_ORCH_RESPONSE_ROUTING_KEY = "inventory.response.#";
 
+export const action = Object.freeze({ ADD: "add", ROLLBACK: "rollback" });
 
+export async function postToOrchastrator(message, connectionChannel) {
+    if (connectionChannel == null) throw new Error("Invalid RabbitMQ channel");
 
-export async function postToOrchastrator(message, ORCH_REQUEST_QUEUE,CONNECTION_CHANNEL){
-    console.log(`[] Posting to Orchastrator with message :${JSON.stringify(message)}`);
-     if(CONNECTION_CHANNEL == null){
-         throw new Error("Invalid Connection Channel");
-     }
-     const msg = {
-         "message" : message,
-         "time" : Date.now()
-     }
-     await postMessage(CONNECTION_CHANNEL,msg,ORCH_REQUEST_QUEUE);
+    const envelope = {
+        message,
+        correlationId: message.correlationId ?? randomUUID(),
+        messageId: randomUUID(),
+        time: new Date().toISOString()
+    };
+
+    await publishToTopic(
+        connectionChannel,
+        `inventory.command.${message.type}`,
+        envelope,
+        "inventory"
+    );
 }
-
-
-export const action = Object.freeze({
-    ADD : "add",
-    ROLLBACK : "rollback"});

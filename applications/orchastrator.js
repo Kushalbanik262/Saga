@@ -1,63 +1,73 @@
+import { randomUUID } from "node:crypto";
+import {
+    createConnectionAndReturnChannel,
+    errorDetails,
+    log,
+    publishToTopic,
+    subscribeToTopic
+} from "./commns/connections.js";
+import {
+    action,
+    INV_ORCH_REQUEST_QUEUE,
+    INV_ORCH_REQUEST_ROUTING_KEY
+} from "./commns/orchastratorclient.js";
 
-// If will Listen to the Inventory
+const SERVICE = "orchestrator";
+let channel;
 
-import { createConnectionAndReturnChannel, postMessage, queueExistsAndConnectionDurable, subscribeToChannel } from "./commns/connections.js";
-import { action, INV_ORCH_REQUEST_QUEUE, INV_ORCH_RESPONSE_QUEUE } from "./commns/orchastratorclient.js";
-
-var channel;
-
-
-
-async function listenToInventory(){
-    if(channel == null){
-        channel = await createConnectionAndReturnChannel(INV_ORCH_REQUEST_QUEUE);
-    }
-    await queueExistsAndConnectionDurable(channel,INV_ORCH_REQUEST_QUEUE);
-
-    await subscribeToChannel(INV_ORCH_REQUEST_QUEUE,channel,async (rawdata)=>{
-        const message = JSON.parse(rawdata.content.toString());
-        // Identify the message type and proceed accordingly
-        console.log(`Message Received From Inventory: ${JSON.stringify(message)}`);
-        const msg = message.message;
-        console.log(msg);
-        //channel.ack(msg);
-        if(msg.type == action.ADD){
-            // give ProceedAction
-            await proceed(INV_ORCH_RESPONSE_QUEUE,msg);
-        }
-        else{
-            await rollback(INV_ORCH_RESPONSE_QUEUE,msg);
-        }
+async function sendInventoryAction(envelope, requestedAction) {
+    const message = envelope.message;
+    const response = {
+        action: requestedAction,
+        id: message.itemId,
+        quantity: message.itemQuantity
+    };
+    await publishToTopic(
+        channel,
+        `inventory.response.${requestedAction.toLowerCase()}`,
+        {
+            message: response,
+            correlationId: envelope.correlationId,
+            messageId: randomUUID(),
+            time: new Date().toISOString()
+        },
+        SERVICE
+    );
+    log(SERVICE, "INFO", "inventory.action.published", {
+        correlationId: envelope.correlationId,
+        action: requestedAction,
+        itemId: message.itemId,
+        quantity: message.itemQuantity
     });
-} 
-
-
-
-async function rollback(queue,msg){
-    const commandMessage = {
-        "action" : "PROCEED",
-        "id": msg.id,
-        "quantity" : msg.quantity
-    }
-    if(channel == null){
-        channel = createConnectionAndReturnChannel(queue);
-    }
-    queueExistsAndConnectionDurable(channel,queue);
-    postMessage(channel,commandMessage,queue);
 }
 
+async function handleInventoryCommand(envelope) {
+    const message = envelope.message;
+    if (!message?.type) throw new Error("Inventory command is missing type");
 
-async function proceed(queue,msg){
-    if(channel == null){
-        channel = createConnectionAndReturnChannel(queue);
-    }
-    queueExistsAndConnectionDurable(channel,queue);
-    const commandMessage = {
-        "action" : "PROCEED",
-        "id": msg.itemId,
-        "quantity" : msg.itemQuantity
-    }
-    postMessage(channel,commandMessage,queue);
+    log(SERVICE, "INFO", "inventory.command.processing", {
+        correlationId: envelope.correlationId,
+        type: message.type,
+        itemId: message.itemId,
+        quantity: message.itemQuantity
+    });
+
+    if (message.type === action.ADD) await sendInventoryAction(envelope, "PROCEED");
+    else if (message.type === action.ROLLBACK) await sendInventoryAction(envelope, "ROLLBACK");
+    else throw new Error(`Unsupported inventory command: ${message.type}`);
 }
 
-listenToInventory();
+async function listenToInventory() {
+    channel = await createConnectionAndReturnChannel(SERVICE);
+    await subscribeToTopic(channel, {
+        service: SERVICE,
+        queue: INV_ORCH_REQUEST_QUEUE,
+        routingKeys: [INV_ORCH_REQUEST_ROUTING_KEY],
+        handler: handleInventoryCommand
+    });
+}
+
+listenToInventory().catch((error) => {
+    log(SERVICE, "ERROR", "topic.listener.failed", { error: errorDetails(error) });
+    process.exitCode = 1;
+});
