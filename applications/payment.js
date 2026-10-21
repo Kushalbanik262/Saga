@@ -1,6 +1,7 @@
 import express from "express";
 import { createConnectionAndReturnChannel, errorDetails, log, subscribeToTopic } from "./commns/connections.js";
 import { action, PAY_ORCH_RESPONSE_QUEUE, PAY_ORCH_RESPONSE_ROUTING_KEY, postToOrchastrator } from "./commns/orchastratorclient.js";
+import { createCompensationLedger } from "./domain/compensationLedger.js";
 const app = express();
 app.use(express.json());
 
@@ -10,12 +11,11 @@ var channel;
 const SERVICE = "payment";
 
 // For Now Considering only single Account
-const account = new Map();
-// DUMMY Account For Test
-account.set("kushal",0);
-account.set("Rohit",0);
-// A payment rollback is valid only for a debit that succeeded.
-const paymentTransactions = new Map();
+const paymentLedger = createCompensationLedger([
+    ["kushal", 0],
+    ["Rohit", 0]
+]);
+const account = paymentLedger.balances;
 
 
 
@@ -116,10 +116,7 @@ async function executeAction(envelope){
         if (requestedAction === "PROCEED") {
             try {
                 const remainingAmount = reduceAmount(userId, amount);
-                paymentTransactions.set(envelope.correlationId, {
-                    userId,
-                    amount: Number(amount)
-                });
+                paymentLedger.record(envelope.correlationId, userId, Number(amount));
                 log(SERVICE, "INFO", "payment.reduction.completed", {
                     correlationId: envelope.correlationId, action: requestedAction,userId: userId, amount, remainingAmount
                 });
@@ -148,20 +145,8 @@ async function executeAction(envelope){
 }
 
 function rollbackPayment(correlationId, userId, amount) {
-    const transaction = paymentTransactions.get(correlationId);
     const parsedAmount = Number(amount);
-
-    if (
-        transaction == null ||
-        transaction.userId !== userId ||
-        transaction.amount !== parsedAmount
-    ) {
-        return false;
-    }
-
-    addAmount(userId, parsedAmount);
-    paymentTransactions.delete(correlationId);
-    return true;
+    return paymentLedger.rollback(correlationId, userId, parsedAmount);
 }
 
 

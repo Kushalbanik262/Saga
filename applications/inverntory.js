@@ -12,15 +12,15 @@ import {
     log,
     subscribeToTopic
 } from "./commns/connections.js";
+import { createCompensationLedger } from "./domain/compensationLedger.js";
 
 const SERVICE = "inventory";
 const PORT = 8081;
 const app = express();
-const map = new Map([["rice", 2], ["shampoo", 20], ["headphone", 3]]);
-// A rollback is valid only for an inventory deduction that actually succeeded.
-// This also prevents a failed purchase from creating stock when its compensation
-// message arrives later.
-const inventoryTransactions = new Map();
+const inventoryLedger = createCompensationLedger([
+    ["rice", 2], ["shampoo", 20], ["headphone", 3]
+]);
+const map = inventoryLedger.balances;
 let channel;
 
 app.use(express.json());
@@ -118,10 +118,7 @@ async function executeAction(envelope) {
     if (requestedAction === "PROCEED") {
         try {
             const remainingQuantity = reduceInventory(id, quantity);
-            inventoryTransactions.set(envelope.correlationId, {
-                itemId: id,
-                quantity: parseInt(quantity, 10)
-            });
+            inventoryLedger.record(envelope.correlationId, id, parseInt(quantity, 10));
             log(SERVICE, "INFO", "inventory.reduction.completed", {
                 correlationId: envelope.correlationId, itemId: id, quantity, remainingQuantity
             });
@@ -150,20 +147,8 @@ async function executeAction(envelope) {
 }
 
 function rollbackInventory(correlationId, itemId, quantity) {
-    const transaction = inventoryTransactions.get(correlationId);
     const parsedQuantity = parseInt(quantity, 10);
-
-    if (
-        transaction == null ||
-        transaction.itemId !== itemId ||
-        transaction.quantity !== parsedQuantity
-    ) {
-        return false;
-    }
-
-    increaseInventory(itemId, parsedQuantity);
-    inventoryTransactions.delete(correlationId);
-    return true;
+    return inventoryLedger.rollback(correlationId, itemId, parsedQuantity);
 }
 
 async function listenToOrchestrator() {
