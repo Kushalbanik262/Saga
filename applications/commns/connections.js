@@ -8,8 +8,27 @@ function serializeError(error) {
 }
 
 export function log(service, level, event, details = {}) {
-    const entry = { timestamp: new Date().toISOString(), service, level, event, ...details };
-    const output = JSON.stringify(entry);
+    const fields = [];
+
+    const appendFields = (prefix, value) => {
+        if (value !== null && typeof value === "object") {
+            for (const [key, nestedValue] of Object.entries(value)) {
+                appendFields(`${prefix}.${key}`, nestedValue);
+            }
+            return;
+        }
+
+        const text = String(value ?? "").replace(/\r?\n/g, "\\n");
+        const formattedText = text.includes(" ") ? `"${text.replace(/"/g, '\\"')}"` : text;
+        fields.push(`${prefix}=${formattedText}`);
+    };
+
+    for (const [key, value] of Object.entries(details)) {
+        appendFields(key, value);
+    }
+
+    const output = `[${new Date().toISOString()}] [${service}] [${level}] ${event}`
+        + (fields.length > 0 ? ` | ${fields.join(" ")}` : "");
     if (level === "ERROR") console.error(output);
     else if (level === "WARN") console.warn(output);
     else console.log(output);

@@ -16,7 +16,11 @@ import {
 const SERVICE = "inventory";
 const PORT = 8081;
 const app = express();
-const map = new Map([["rice", 10], ["shampoo", 20], ["headphone", 3]]);
+const map = new Map([["rice", 2], ["shampoo", 20], ["headphone", 3]]);
+// A rollback is valid only for an inventory deduction that actually succeeded.
+// This also prevents a failed purchase from creating stock when its compensation
+// message arrives later.
+const inventoryTransactions = new Map();
 let channel;
 
 app.use(express.json());
@@ -24,6 +28,10 @@ app.use(express.json());
 app.post("/buy/items", async (req, res) => {
     const correlationId = req.get("x-correlation-id") ?? randomUUID();
     const request = { ...req.body, correlationId };
+
+    if (request.userId == null || request.userId === "") {
+        return res.status(400).json({ message: "userId is required", correlationId });
+    }
 
     log(SERVICE, "INFO", "inventory.purchase.requested", {
         correlationId,
@@ -37,7 +45,8 @@ app.post("/buy/items", async (req, res) => {
             message: "Inventory operation accepted",
             correlationId,
             itemId: request.id,
-            quantity: request.quantity
+            quantity: request.quantity,
+            userId: request.userId
         });
     } catch (error) {
         log(SERVICE, "ERROR", "inventory.purchase.request.failed", {
@@ -54,7 +63,9 @@ app.post("/rollback", async (req, res) => {
     const correlationId = req.get("x-correlation-id") ?? randomUUID();
     const { id, quantity } = req.body;
     try {
-        increaseInventory(id, quantity);
+        if (!rollbackInventory(correlationId, id, quantity)) {
+            throw new Error(`No inventory transaction found for rollback ${correlationId}`);
+        }
         log(SERVICE, "INFO", "inventory.rollback.completed", {
             correlationId, itemId: id, quantity, remainingQuantity: map.get(id)
         });
@@ -87,12 +98,14 @@ function reduceInventory(itemId, quantity) {
 async function commandToOrchestrator(request, commandType) {
     const command = {
         type: commandType,
-        itemId: request.id,
+        itemId: request.itemId ?? request.id,
         itemQuantity: request.quantity,
-        correlationId: request.correlationId
+        correlationId: request.correlationId,
+        userId: request.userId
     };
+    log(SERVICE,"DEBUG","inventory.orchastrator.command",command);
     if (channel == null) channel = await createConnectionAndReturnChannel(SERVICE);
-    await postToOrchastrator(command, channel);
+    await postToOrchastrator(command, channel,SERVICE);
 }
 
 async function executeAction(envelope) {
@@ -105,6 +118,10 @@ async function executeAction(envelope) {
     if (requestedAction === "PROCEED") {
         try {
             const remainingQuantity = reduceInventory(id, quantity);
+            inventoryTransactions.set(envelope.correlationId, {
+                itemId: id,
+                quantity: parseInt(quantity, 10)
+            });
             log(SERVICE, "INFO", "inventory.reduction.completed", {
                 correlationId: envelope.correlationId, itemId: id, quantity, remainingQuantity
             });
@@ -115,13 +132,38 @@ async function executeAction(envelope) {
             await commandToOrchestrator({ ...message, correlationId: envelope.correlationId }, action.ROLLBACK);
         }
     } else if (requestedAction === "ROLLBACK") {
-        increaseInventory(id, quantity);
+        if (!rollbackInventory(envelope.correlationId, id, quantity)) {
+            log(SERVICE, "WARN", "inventory.rollback.ignored", {
+                correlationId: envelope.correlationId,
+                itemId: id,
+                quantity,
+                reason: "No successful inventory transaction found"
+            });
+            return;
+        }
         log(SERVICE, "INFO", "inventory.rollback.completed", {
             correlationId: envelope.correlationId, itemId: id, quantity, remainingQuantity: map.get(id)
         });
     } else {
         throw new Error(`Unsupported inventory action: ${requestedAction}`);
     }
+}
+
+function rollbackInventory(correlationId, itemId, quantity) {
+    const transaction = inventoryTransactions.get(correlationId);
+    const parsedQuantity = parseInt(quantity, 10);
+
+    if (
+        transaction == null ||
+        transaction.itemId !== itemId ||
+        transaction.quantity !== parsedQuantity
+    ) {
+        return false;
+    }
+
+    increaseInventory(itemId, parsedQuantity);
+    inventoryTransactions.delete(correlationId);
+    return true;
 }
 
 async function listenToOrchestrator() {
